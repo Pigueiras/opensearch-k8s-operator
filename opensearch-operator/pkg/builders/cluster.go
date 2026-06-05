@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,7 +34,183 @@ const (
 	ConfigurationChecksumAnnotation  = "opensearch.org/config"
 	defaultMonitoringPlugin          = "https://github.com/opensearch-project/opensearch-prometheus-exporter/releases/download/%s.0/prometheus-exporter-%s.0.zip"
 	securityconfigChecksumAnnotation = "securityconfig/checksum"
+
+	nodeAttributesVolumeName = "node-attributes"
+	nodeAttributesFileName   = "attributes.env"
+
+	// NodeAttributesClusterRoleName is the name of the shared, install-time
+	// ClusterRole that grants "get" on nodes. It mirrors Strimzi's
+	// "strimzi-kafka-broker" role: a single cluster-scoped role, shipped by the
+	// Helm chart and bound to the operator's own ServiceAccount (the
+	// "delegation" binding). The operator only creates a per-cluster
+	// ClusterRoleBinding that points this role at the cluster's ServiceAccount,
+	// so it never needs to create ClusterRoles or hold the "escalate" verb.
+	NodeAttributesClusterRoleName = "opensearch-node-attributes"
 )
+
+// nodeAttributesEnabled reports whether the cluster maps any Kubernetes node
+// labels onto OpenSearch node attributes.
+func nodeAttributesEnabled(cr *opensearchv1.OpenSearchCluster) bool {
+	return len(cr.Spec.General.NodeAttributes) > 0
+}
+
+// NodeAttributesServiceAccountName returns the name of the managed ServiceAccount
+// created by the operator when nodeAttributes are enabled.
+func NodeAttributesServiceAccountName(cr *opensearchv1.OpenSearchCluster) string {
+	return cr.Name + "-node-attributes"
+}
+
+// NodeAttributesClusterRoleBindingName returns the name of the per-cluster
+// ClusterRoleBinding created by the operator. The namespace is embedded to avoid
+// collisions across namespaces since ClusterRoleBindings are cluster-scoped.
+func NodeAttributesClusterRoleBindingName(cr *opensearchv1.OpenSearchCluster) string {
+	return cr.Name + "-" + cr.Namespace + "-node-attributes"
+}
+
+// NodeAttributesManagedServiceAccount builds the ServiceAccount owned by the cluster.
+func NodeAttributesManagedServiceAccount(cr *opensearchv1.OpenSearchCluster) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      NodeAttributesServiceAccountName(cr),
+			Namespace: cr.Namespace,
+			Labels:    map[string]string{helpers.ClusterLabel: cr.Name},
+		},
+	}
+}
+
+// NodeAttributesClusterRoleBinding binds the shared node-attributes ClusterRole
+// to the managed ServiceAccount. The ClusterRole itself is shipped by the Helm
+// chart and bound to the operator's ServiceAccount, so creating this binding
+// does not require the "escalate" verb (the operator already holds nodes/get).
+func NodeAttributesClusterRoleBinding(cr *opensearchv1.OpenSearchCluster) *rbacv1.ClusterRoleBinding {
+	return NodeAttributesClusterRoleBindingWithRoleName(cr, NodeAttributesClusterRoleName)
+}
+
+// NodeAttributesClusterRoleBindingWithRoleName binds the configured shared
+// node-attributes ClusterRole to the managed ServiceAccount.
+func NodeAttributesClusterRoleBindingWithRoleName(cr *opensearchv1.OpenSearchCluster, roleName string) *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   NodeAttributesClusterRoleBindingName(cr),
+			Labels: map[string]string{helpers.ClusterLabel: cr.Name},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     roleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      NodeAttributesServiceAccountName(cr),
+				Namespace: cr.Namespace,
+			},
+		},
+	}
+}
+
+// NodeAttributesEffectiveServiceAccount returns the service account name to set
+// on OpenSearch pods when nodeAttributes are enabled. If the user has explicitly
+// configured one in spec.general.serviceAccount, that takes precedence.
+func NodeAttributesEffectiveServiceAccount(cr *opensearchv1.OpenSearchCluster) string {
+	if cr.Spec.General.ServiceAccount != "" {
+		return cr.Spec.General.ServiceAccount
+	}
+	return NodeAttributesServiceAccountName(cr)
+}
+
+// nodeAttributesDir is the directory in the OpenSearch config folder where the
+// resolved node attributes file is shared between the init and main containers.
+func nodeAttributesDir(cr *opensearchv1.OpenSearchCluster) string {
+	return cr.Spec.General.GetOpenSearchHome() + "/config/node-attributes"
+}
+
+// nodeAttributesVolume is the emptyDir shared between the node-attributes init
+// container (writer) and the OpenSearch container (reader).
+func nodeAttributesVolume() corev1.Volume {
+	return corev1.Volume{
+		Name:         nodeAttributesVolumeName,
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	}
+}
+
+func nodeAttributesVolumeMount(cr *opensearchv1.OpenSearchCluster) corev1.VolumeMount {
+	return corev1.VolumeMount{
+		Name:      nodeAttributesVolumeName,
+		MountPath: nodeAttributesDir(cr),
+	}
+}
+
+// nodeAttributesEntrypoint wraps the OpenSearch entrypoint so that the resolved
+// attributes file is sourced first, exporting the node.attr.* placeholders that
+// opensearch.yml references before the JVM starts.
+func nodeAttributesEntrypoint(cr *opensearchv1.OpenSearchCluster, entrypoint string) string {
+	return fmt.Sprintf(". %s/%s && %s", nodeAttributesDir(cr), nodeAttributesFileName, entrypoint)
+}
+
+// nodeAttributesInitContainer builds an init container that queries the
+// Kubernetes API for the node hosting the pod and writes the configured labels
+// as exported, shell-quoted environment variables to the shared volume. The
+// OpenSearch image is used because it ships with bash and curl; the in-cluster
+// ServiceAccount credentials are mounted automatically by Kubernetes.
+func nodeAttributesInitContainer(
+	cr *opensearchv1.OpenSearchCluster,
+	image opensearchv1.ImageSpec,
+	resources corev1.ResourceRequirements,
+) corev1.Container {
+	attrsFile := nodeAttributesDir(cr) + "/" + nodeAttributesFileName
+
+	var script strings.Builder
+	script.WriteString("#!/usr/bin/env bash\n")
+	script.WriteString("set -euo pipefail\n\n")
+	fmt.Fprintf(&script, "attrs_file=%q\n", attrsFile)
+	script.WriteString("sa=/var/run/secrets/kubernetes.io/serviceaccount\n")
+	script.WriteString("node_json=\"$(curl -sS --fail --cacert \"$sa/ca.crt\" ")
+	script.WriteString("-H \"Authorization: Bearer $(cat \"$sa/token\")\" ")
+	script.WriteString("\"https://kubernetes.default.svc/api/v1/nodes/$NODE_NAME\")\"\n\n")
+
+	// read_label prints the value of the node label given as $1, or an empty
+	// string when the label is absent. The label key is matched literally (not
+	// as a regex) so keys containing dots or slashes are handled safely.
+	script.WriteString("read_label() {\n")
+	script.WriteString("  local key=\"$1\" line\n")
+	script.WriteString("  while IFS= read -r line; do\n")
+	script.WriteString("    line=\"${line#\"${line%%[![:space:]]*}\"}\"\n")
+	script.WriteString("    if [[ \"$line\" == \"\\\"$key\\\":\"* ]]; then\n")
+	script.WriteString("      line=\"${line#*:}\"\n")
+	script.WriteString("      line=\"${line#\"${line%%[![:space:]]*}\"}\"\n") // strip whitespace before the opening quote
+	script.WriteString("      line=\"${line#\\\"}\"\n")
+	script.WriteString("      line=\"${line%\\\"}\"\n")
+	script.WriteString("      printf '%s' \"$line\"\n")
+	script.WriteString("      return 0\n")
+	script.WriteString("    fi\n")
+	script.WriteString("  done < <(printf '%s' \"$node_json\" | tr ',{}' '\\n')\n")
+	script.WriteString("}\n\n")
+
+	script.WriteString(": > \"$attrs_file\"\n")
+	for _, attr := range cr.Spec.General.NodeAttributes {
+		// printf %q quotes the (untrusted) label value so the sourced file
+		// stays a safe assignment regardless of the value's contents.
+		fmt.Fprintf(&script, "printf 'export %s=%%q\\n' \"$(read_label %q)\" >> \"$attrs_file\"\n",
+			helpers.NodeAttributeEnvVar(attr.Name), attr.NodeLabel)
+	}
+
+	return corev1.Container{
+		Name:            nodeAttributesVolumeName,
+		Image:           image.GetImage(),
+		ImagePullPolicy: image.GetImagePullPolicy(),
+		Resources:       resources,
+		Command:         []string{"/bin/bash", "-c", script.String()},
+		Env: []corev1.EnvVar{
+			{
+				Name:      "NODE_NAME",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "spec.nodeName"}},
+			},
+		},
+		VolumeMounts:    []corev1.VolumeMount{nodeAttributesVolumeMount(cr)},
+		SecurityContext: cr.Spec.General.SecurityContext,
+	}
+}
 
 // GetDefaultAffinity returns default pod anti-affinity that prefers to avoid
 // co-locating pods from the same cluster on a single node.
@@ -388,6 +565,11 @@ func NewSTSForNodePool(
 		startUpCommand = cr.Spec.General.Command
 	}
 
+	if nodeAttributesEnabled(cr) {
+		volumes = append(volumes, nodeAttributesVolume())
+		volumeMounts = append(volumeMounts, nodeAttributesVolumeMount(cr))
+	}
+
 	var pluginslist []string
 	if cr.Spec.General.Monitoring.Enable {
 		if cr.Spec.General.Monitoring.PluginURL != "" {
@@ -401,6 +583,13 @@ func NewSTSForNodePool(
 
 	mainCommand := helpers.BuildMainCommand("./bin/opensearch-plugin", pluginslist, true, startUpCommand)
 
+	// Source the resolved node attributes before anything — including the plugin
+	// installer — so that opensearch.yml placeholders are already resolved when
+	// opensearch-plugin reads the config file.
+	if nodeAttributesEnabled(cr) {
+		mainCommand[len(mainCommand)-1] = nodeAttributesEntrypoint(cr, mainCommand[len(mainCommand)-1])
+	}
+
 	podSecurityContext := cr.Spec.General.PodSecurityContext
 	securityContext := cr.Spec.General.SecurityContext
 
@@ -408,6 +597,10 @@ func NewSTSForNodePool(
 
 	if len(node.InitContainers) > 0 {
 		initContainers = append(initContainers, node.InitContainers...)
+	}
+
+	if nodeAttributesEnabled(cr) {
+		initContainers = append(initContainers, nodeAttributesInitContainer(cr, image, resources))
 	}
 
 	if !helpers.SkipInitContainer() {
@@ -619,9 +812,14 @@ func NewSTSForNodePool(
 							SecurityContext: securityContext,
 						},
 					}, node.SidecarContainers...),
-					InitContainers:            initContainers,
-					Volumes:                   volumes,
-					ServiceAccountName:        cr.Spec.General.ServiceAccount,
+					InitContainers: initContainers,
+					Volumes:        volumes,
+					ServiceAccountName: func() string {
+						if nodeAttributesEnabled(cr) {
+							return NodeAttributesEffectiveServiceAccount(cr)
+						}
+						return cr.Spec.General.ServiceAccount
+					}(),
 					NodeSelector:              node.NodeSelector,
 					Tolerations:               node.Tolerations,
 					Affinity:                  getAffinity(node.Affinity, cr.Name),
@@ -1121,6 +1319,15 @@ func NewBootstrapPod(
 
 	startUpCommand := "./opensearch-docker-entrypoint.sh"
 
+	// The bootstrap pod mounts the same opensearch.yml as the node pools, so it
+	// must resolve the node.attr.* placeholders too. Reuse the init container
+	// (with the bootstrap resources) to populate them before startup.
+	if nodeAttributesEnabled(cr) {
+		volumes = append(volumes, nodeAttributesVolume())
+		volumeMounts = append(volumeMounts, nodeAttributesVolumeMount(cr))
+		initContainers = append(initContainers, nodeAttributesInitContainer(cr, image, resources))
+	}
+
 	// Use General.PluginsList by default, override with Bootstrap.PluginsList if set
 	pluginslist := cr.Spec.General.PluginsList
 	if len(cr.Spec.Bootstrap.PluginsList) > 0 {
@@ -1128,6 +1335,13 @@ func NewBootstrapPod(
 	}
 	pluginslist = helpers.RemoveDuplicateStrings(pluginslist)
 	mainCommand := helpers.BuildMainCommand("./bin/opensearch-plugin", pluginslist, true, startUpCommand)
+
+	// Source the resolved node attributes before anything — including the plugin
+	// installer — so that opensearch.yml placeholders are already resolved when
+	// opensearch-plugin reads the config file.
+	if nodeAttributesEnabled(cr) {
+		mainCommand[len(mainCommand)-1] = nodeAttributesEntrypoint(cr, mainCommand[len(mainCommand)-1])
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        BootstrapPodName(cr),
@@ -1170,17 +1384,22 @@ func NewBootstrapPod(
 					SecurityContext: securityContext,
 				},
 			},
-			InitContainers:     initContainers,
-			Volumes:            volumes,
-			ServiceAccountName: cr.Spec.General.ServiceAccount,
-			NodeSelector:       cr.Spec.Bootstrap.NodeSelector,
-			Tolerations:        cr.Spec.Bootstrap.Tolerations,
-			Affinity:           getAffinity(cr.Spec.Bootstrap.Affinity, cr.Name),
-			ImagePullSecrets:   image.ImagePullSecrets,
-			SecurityContext:    podSecurityContext,
-			HostAliases:        hostAliases,
-			PriorityClassName:  cr.Spec.Bootstrap.PriorityClassName,
-			HostNetwork:        cr.Spec.General.HostNetwork,
+			InitContainers: initContainers,
+			Volumes:        volumes,
+			ServiceAccountName: func() string {
+				if nodeAttributesEnabled(cr) {
+					return NodeAttributesEffectiveServiceAccount(cr)
+				}
+				return cr.Spec.General.ServiceAccount
+			}(),
+			NodeSelector:      cr.Spec.Bootstrap.NodeSelector,
+			Tolerations:       cr.Spec.Bootstrap.Tolerations,
+			Affinity:          getAffinity(cr.Spec.Bootstrap.Affinity, cr.Name),
+			ImagePullSecrets:  image.ImagePullSecrets,
+			SecurityContext:   podSecurityContext,
+			HostAliases:       hostAliases,
+			PriorityClassName: cr.Spec.Bootstrap.PriorityClassName,
+			HostNetwork:       cr.Spec.General.HostNetwork,
 		},
 	}
 

@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-attributes-delegation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: opensearch-node-attributes
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: system

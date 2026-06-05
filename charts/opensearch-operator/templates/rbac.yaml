@@ -20,6 +20,7 @@ rules:
   - persistentvolumeclaims
   - pods
   - secrets
+  - serviceaccounts
   - services
   verbs:
   - create
@@ -156,6 +157,68 @@ rules:
   - patch
   - update
   - watch
+{{- if not .Values.useRoleBindings }}
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterrolebindings
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+{{- end }}
+{{- if not .Values.useRoleBindings }}
+---
+# Shared, cluster-scoped role granting "get" on nodes. It is bound to the
+# operator's ServiceAccount below (the "delegation" binding) so the operator can
+# grant the same permission to per-cluster ServiceAccounts without the "escalate"
+# verb. The operator also binds this role to each OpenSearchCluster's
+# ServiceAccount when spec.general.nodeAttributes is configured, allowing the
+# node-attributes init container to read node labels. Named statically so the
+# operator can reference it at runtime (mirrors Strimzi's strimzi-kafka-broker).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: opensearch-node-attributes
+  labels:
+    {{- include "opensearch-operator.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+---
+# Delegation binding: grants the node-attributes ClusterRole to the operator's
+# own ServiceAccount so it can delegate that role to cluster ServiceAccounts
+# without needing the "escalate" verb (Kubernetes only allows creating bindings
+# for permissions the creator already holds).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "opensearch-operator.fullname" . }}-node-attributes-delegation
+  labels:
+    {{- include "opensearch-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: opensearch-node-attributes
+subjects:
+- kind: ServiceAccount
+  name: {{ include "opensearch-operator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- if not .Values.useRoleBindings }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
