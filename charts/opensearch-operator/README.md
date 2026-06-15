@@ -70,7 +70,7 @@ The following table lists the configurable parameters of the Helm chart.
 | `manager.readinessProbe.initialDelaySeconds` | int | `10` |  |
 | `manager.parallelRecoveryEnabled` | bool | `true` |  |
 | `manager.pprofEndpointsEnabled` | bool | `false` |  |
-| `manager.image.repository` | string | `"opensearchproject/opensearch-operator"` |  |
+| `manager.image.repository` | string | `"gitlab-registry.cern.ch/opensearch/kubernetes/opensearch-k8s-operator"` |  |
 | `manager.image.tag` | string | `""` |  |
 | `manager.image.pullPolicy` | string | `"Always"` |  |
 | `manager.imagePullSecrets` | list | `[]` |  |
