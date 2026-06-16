@@ -56,6 +56,16 @@ manager:
   imagePullSecrets: []
   # - name: secretName
 
+  ## Optional image pull secret managed by this chart
+  imagePullSecret:
+    create: false
+    # name defaults to "<release-name>-<chart-name>-image-pull-secret"
+    name: ""
+    registry: ""
+    username: ""
+    password: ""
+    email: ""
+
   dnsBase: cluster.local
 
   # Log level of the operator. Possible values: debug, info, warn, error

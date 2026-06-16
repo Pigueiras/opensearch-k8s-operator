@@ -60,3 +60,22 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Create the name of the optional image pull secret managed by this chart.
+*/}}
+{{- define "opensearch-operator.imagePullSecretName" -}}
+{{- default (printf "%s-image-pull-secret" (include "opensearch-operator.fullname" .)) .Values.manager.imagePullSecret.name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create the docker config JSON for the optional image pull secret.
+*/}}
+{{- define "opensearch-operator.imagePullSecretDockerConfigJson" -}}
+{{- $registry := required "manager.imagePullSecret.registry is required when manager.imagePullSecret.create=true" .Values.manager.imagePullSecret.registry }}
+{{- $username := required "manager.imagePullSecret.username is required when manager.imagePullSecret.create=true" .Values.manager.imagePullSecret.username }}
+{{- $password := required "manager.imagePullSecret.password is required when manager.imagePullSecret.create=true" .Values.manager.imagePullSecret.password }}
+{{- $auth := printf "%s:%s" $username $password | b64enc }}
+{{- $authConfig := dict "username" $username "password" $password "email" .Values.manager.imagePullSecret.email "auth" $auth }}
+{{- dict "auths" (dict $registry $authConfig) | toJson | b64enc }}
+{{- end }}
