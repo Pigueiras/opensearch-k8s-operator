@@ -83,7 +83,9 @@ rules:
   - update
   - watch
 - apiGroups:
+  {{- if ne .Values.legacyAPI.enabled false }}
   - opensearch.opster.io
+  {{- end }}
   - opensearch.org
   resources:
   - opensearchactiongroups
@@ -105,7 +107,9 @@ rules:
   - update
   - watch
 - apiGroups:
+  {{- if ne .Values.legacyAPI.enabled false }}
   - opensearch.opster.io
+  {{- end }}
   - opensearch.org
   resources:
   - opensearchactiongroups/finalizers
@@ -121,7 +125,9 @@ rules:
   verbs:
   - update
 - apiGroups:
+  {{- if ne .Values.legacyAPI.enabled false }}
   - opensearch.opster.io
+  {{- end }}
   - opensearch.org
   resources:
   - opensearchactiongroups/status
