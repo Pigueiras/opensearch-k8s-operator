@@ -47,8 +47,8 @@ manager:
   pprofEndpointsEnabled: false
 
   image:
-    repository: gitlab-registry.cern.ch/opensearch/kubernetes/opensearch-k8s-operator
-    ## tag default uses appVersion from Chart.yaml
+    repository: opensearchproject/opensearch-operator
+    ## tag default uses appVersion from Chart.yaml, to override specify tag tag: "v1.1"
     tag: ""
     pullPolicy: "Always"
 
