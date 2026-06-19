@@ -74,12 +74,6 @@ The following table lists the configurable parameters of the Helm chart.
 | `manager.image.tag` | string | `""` |  |
 | `manager.image.pullPolicy` | string | `"Always"` |  |
 | `manager.imagePullSecrets` | list | `[]` |  |
-| `manager.imagePullSecret.create` | bool | `false` |  |
-| `manager.imagePullSecret.name` | string | `""` |  |
-| `manager.imagePullSecret.registry` | string | `""` |  |
-| `manager.imagePullSecret.username` | string | `""` |  |
-| `manager.imagePullSecret.password` | string | `""` |  |
-| `manager.imagePullSecret.email` | string | `""` |  |
 | `manager.dnsBase` | string | `"cluster.local"` |  |
 | `manager.loglevel` | string | `"info"` |  |
 | `manager.watchNamespace` | string | `nil` |  |
